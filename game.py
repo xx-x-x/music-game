@@ -20,6 +20,7 @@ os.environ.setdefault('OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS', '0')
 
 _BASE      = os.path.dirname(__file__)
 _SAM       = os.path.join(_BASE, "sounds_and_music")
+LOGO_PATH  = os.path.join(_BASE, "logo.png")
 SRC_DIR    = os.path.join(_SAM,  "music")    if os.path.isdir(os.path.join(_SAM,"music"))    else os.path.join(_BASE,"src")
 SOUNDS_DIR = os.path.join(_SAM,  "sound_effects") if os.path.isdir(os.path.join(_SAM,"sound_effects")) else os.path.join(_BASE,"sounds")
 CFG_PATH   = os.path.join(os.path.dirname(__file__), "config.json")
@@ -1007,6 +1008,12 @@ class MusicGame:
         self._font_m  = _font(18)
         self._font_l  = _font(44)
         self._font_xl = _font(62)
+
+        # set window / dock icon
+        if os.path.exists(LOGO_PATH):
+            icon = pygame.image.load(LOGO_PATH).convert_alpha()
+            icon = pygame.transform.smoothscale(icon, (64, 64))
+            pygame.display.set_icon(icon)
 
         self._engine       = AudioEngine()
         self._tracker      = HandTracker()
