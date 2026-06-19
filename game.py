@@ -18,8 +18,10 @@ import numpy as np
 
 os.environ.setdefault('OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS', '0')
 
-SRC_DIR    = os.path.join(os.path.dirname(__file__), "src")
-SOUNDS_DIR = os.path.join(os.path.dirname(__file__), "sounds")
+_BASE      = os.path.dirname(__file__)
+_SAM       = os.path.join(_BASE, "sounds_and_music")
+SRC_DIR    = os.path.join(_SAM,  "music")    if os.path.isdir(os.path.join(_SAM,"music"))    else os.path.join(_BASE,"src")
+SOUNDS_DIR = os.path.join(_SAM,  "sound_effects") if os.path.isdir(os.path.join(_SAM,"sound_effects")) else os.path.join(_BASE,"sounds")
 CFG_PATH   = os.path.join(os.path.dirname(__file__), "config.json")
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
 
@@ -82,19 +84,26 @@ HAND_CONNECTIONS = [
 ]
 
 # ── gesture slots ─────────────────────────────────────────────────────────────
-GESTURE_SLOTS = ['peace_right', 'peace_left', 'ok_right', 'ok_left', 'both_peace']
+GESTURE_SLOTS = [
+    'peace_right', 'peace_left', 'ok_right', 'ok_left', 'both_peace',
+    'key_1','key_2','key_3','key_4','key_5','key_6','key_7','key_8','key_9',
+]
 GESTURE_LABELS = {
     'peace_right': 'V-sign  RIGHT',
     'peace_left':  'V-sign  LEFT',
     'ok_right':    'OK      RIGHT',
     'ok_left':     'OK      LEFT',
     'both_peace':  'V+V  Both',
+    **{f'key_{i}': f'Hotkey  [{i}]' for i in range(1,10)},
 }
 GESTURE_EMOJI = {
     'peace_right': 'V-R', 'peace_left': 'V-L',
     'ok_right':    'OK-R', 'ok_left':   'OK-L',
     'both_peace':  'V+V',
+    **{f'key_{i}': str(i) for i in range(1,10)},
 }
+# pygame key constants are plain ints, safe to use before init
+KEY_SLOTS = {49+i: f'key_{i+1}' for i in range(9)}   # 49='1', 50='2', ... 57='9'
 
 VFX_NAMES = ['Nebula', 'Snowflakes', 'Shader']
 
@@ -192,7 +201,10 @@ def get_effect(idx):
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-DEFAULT_CFG = {'peace_right':0,'peace_left':1,'ok_right':2,'ok_left':3,'both_peace':4}
+DEFAULT_CFG = {
+    'peace_right':0,'peace_left':1,'ok_right':2,'ok_left':3,'both_peace':4,
+    **{f'key_{i}': i for i in range(1,10)},
+}
 
 def load_config():
     if os.path.exists(CFG_PATH):
@@ -806,51 +818,145 @@ class FilePicker:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ConfigPanel:
-    def __init__(self,cfg):
-        self.visible=False; self.cfg=cfg; self._sel=0
-        self._W,self._H=700,420; self._x=(W-self._W)//2; self._y=(H-self._H)//2
+    ROW_H  = 40
+    ROWS   = 10   # visible rows at a time
 
-    def open(self): self.visible=True
-    def close(self): save_config(self.cfg); self.visible=False
+    def __init__(self, cfg):
+        self.visible = False
+        self.cfg     = cfg
+        self._sel    = 0
+        self._scroll = 0          # first visible gesture row
+        self._W = 860; self._H = 520
+        self._x = (W - self._W)//2; self._y = (H - self._H)//2
 
-    def handle_event(self,ev):
+    def _n(self): return max(1, len(EFFECT_FILES))
+
+    def open(self):  self.visible = True
+    def close(self): save_config(self.cfg); self.visible = False
+
+    def _randomize(self):
+        idxs = list(range(len(EFFECT_FILES)))
+        random.shuffle(idxs)
+        for i, slot in enumerate(GESTURE_SLOTS):
+            self.cfg[slot] = idxs[i % len(idxs)]
+
+    # returns rect for a button label/position
+    def _btn_rects(self, bx, by, bw, bh):
+        btn_y = by + bh - 48
+        rnd   = pygame.Rect(bx + bw//2 - 180, btn_y, 160, 34)
+        save  = pygame.Rect(bx + bw//2 + 20,  btn_y, 160, 34)
+        return rnd, save
+
+    def handle_event(self, ev):
         if not self.visible: return False
-        if ev.type==pygame.KEYDOWN:
-            if ev.key in(pygame.K_ESCAPE,pygame.K_c): self.close()
-            elif ev.key==pygame.K_UP:    self._sel=(self._sel-1)%len(GESTURE_SLOTS)
-            elif ev.key==pygame.K_DOWN:  self._sel=(self._sel+1)%len(GESTURE_SLOTS)
-            elif ev.key==pygame.K_LEFT:
-                s=GESTURE_SLOTS[self._sel]; self.cfg[s]=(self.cfg[s]-1)%max(1,len(EFFECT_FILES))
-            elif ev.key==pygame.K_RIGHT:
-                s=GESTURE_SLOTS[self._sel]; self.cfg[s]=(self.cfg[s]+1)%max(1,len(EFFECT_FILES))
-        if ev.type==pygame.MOUSEBUTTONDOWN and ev.button==1:
-            mx,my=ev.pos; bx,by=self._x,self._y
-            if not(bx<mx<bx+self._W and by<my<by+self._H): self.close(); return True
-            for i,slot in enumerate(GESTURE_SLOTS):
-                ry=by+80+i*52
-                if ry<my<ry+44:
-                    self._sel=i
-                    al=bx+self._W-110; ar=bx+self._W-50
-                    if al<mx<al+44: self.cfg[slot]=(self.cfg[slot]-1)%max(1,len(EFFECT_FILES))
-                    elif ar<mx<ar+44: self.cfg[slot]=(self.cfg[slot]+1)%max(1,len(EFFECT_FILES))
+        bx,by = self._x,self._y; bw,bh = self._W,self._H
+        rnd_r, save_r = self._btn_rects(bx,by,bw,bh)
+
+        if ev.type == pygame.KEYDOWN:
+            if ev.key in (pygame.K_ESCAPE, pygame.K_c): self.close()
+            elif ev.key == pygame.K_UP:
+                self._sel = (self._sel-1) % len(GESTURE_SLOTS)
+                self._scroll = min(self._scroll, self._sel)
+                if self._sel < self._scroll: self._scroll = self._sel
+            elif ev.key == pygame.K_DOWN:
+                self._sel = (self._sel+1) % len(GESTURE_SLOTS)
+                if self._sel >= self._scroll + self.ROWS:
+                    self._scroll = self._sel - self.ROWS + 1
+            elif ev.key == pygame.K_LEFT:
+                s = GESTURE_SLOTS[self._sel]
+                self.cfg[s] = (self.cfg[s]-1) % self._n()
+            elif ev.key == pygame.K_RIGHT:
+                s = GESTURE_SLOTS[self._sel]
+                self.cfg[s] = (self.cfg[s]+1) % self._n()
+            elif ev.key == pygame.K_r: self._randomize()
+            elif ev.key == pygame.K_s: save_config(self.cfg)
+
+        if ev.type == pygame.MOUSEBUTTONDOWN:
+            mx,my = ev.pos
+            if ev.button in (4,5):   # scroll wheel
+                self._scroll = max(0, min(len(GESTURE_SLOTS)-self.ROWS,
+                                          self._scroll + (-1 if ev.button==4 else 1)))
+                return True
+            if ev.button != 1: return True
+            if rnd_r.collidepoint(mx,my):  self._randomize(); return True
+            if save_r.collidepoint(mx,my): save_config(self.cfg); return True
+            if not(bx<mx<bx+bw and by<my<by+bh): self.close(); return True
+            for vi in range(self.ROWS):
+                gi = self._scroll + vi
+                if gi >= len(GESTURE_SLOTS): break
+                slot = GESTURE_SLOTS[gi]
+                ry   = by + 76 + vi*self.ROW_H
+                if not(ry < my < ry+self.ROW_H): continue
+                self._sel = gi
+                # < > arrows
+                arr_l = pygame.Rect(bx+bw-150, ry+4, 28, 28)
+                arr_r = pygame.Rect(bx+bw-46,  ry+4, 28, 28)
+                if arr_l.collidepoint(mx,my):
+                    self.cfg[slot] = (self.cfg[slot]-1) % self._n()
+                elif arr_r.collidepoint(mx,my):
+                    self.cfg[slot] = (self.cfg[slot]+1) % self._n()
         return True
 
-    def draw(self,surf,font_m,font_s):
+    def draw(self, surf, font_m, font_s):
         if not self.visible: return
-        bx,by=self._x,self._y; bw,bh=self._W,self._H
-        s=pygame.Surface((bw,bh),pygame.SRCALPHA); s.fill((*P0,245))
-        pygame.draw.rect(s,P3,(0,0,bw,bh),2,border_radius=10); surf.blit(s,(bx,by))
-        surf.blit(font_m.render('GESTURE CONFIG  [UP/DN select  LT/RT change  ESC close]',True,P3),(bx+14,by+14))
-        for i,slot in enumerate(GESTURE_SLOTS):
-            ry=by+80+i*52; active=i==self._sel
-            if active: pygame.draw.rect(surf,(*P2,60),(bx+6,ry,bw-12,44),border_radius=6)
-            col=WHT if active else TXT
-            surf.blit(font_s.render(GESTURE_LABELS[slot],True,col),(bx+20,ry+12))
-            idx=self.cfg.get(slot,0)%max(1,len(EFFECT_NAMES))
-            name=EFFECT_NAMES[idx] if EFFECT_NAMES else '?'
-            pygame.draw.polygon(surf,P2,[(bx+bw-110,ry+22),(bx+bw-90,ry+10),(bx+bw-90,ry+34)])
-            surf.blit(font_s.render(name,True,PA4),(bx+bw-84,ry+12))
-            pygame.draw.polygon(surf,P2,[(bx+bw-44,ry+22),(bx+bw-64,ry+10),(bx+bw-64,ry+34)])
+        bx,by = self._x,self._y; bw,bh = self._W,self._H
+        s = pygame.Surface((bw,bh), pygame.SRCALPHA); s.fill((*P0,248))
+        pygame.draw.rect(s, P3, (0,0,bw,bh), 2, border_radius=10)
+        surf.blit(s, (bx,by))
+
+        # title
+        surf.blit(font_m.render('GESTURE  SOUND  CONFIG', True, P3), (bx+16, by+14))
+        surf.blit(font_s.render('[UP/DN] select   [LT/RT] change sound   [R] randomize   [S] save   [ESC] close',
+                                True, TXTSUB), (bx+16, by+42))
+
+        # column headers
+        surf.blit(font_s.render('GESTURE',   True, P2), (bx+20,  by+62))
+        surf.blit(font_s.render('SOUND',     True, P2), (bx+280, by+62))
+        surf.blit(font_s.render('#',         True, P2), (bx+bw-220, by+62))
+
+        total = len(GESTURE_SLOTS)
+        for vi in range(self.ROWS):
+            gi = self._scroll + vi
+            if gi >= total: break
+            slot   = GESTURE_SLOTS[gi]
+            ry     = by + 76 + vi*self.ROW_H
+            active = gi == self._sel
+
+            if active:
+                pygame.draw.rect(surf, (*P2,50), (bx+4, ry, bw-8, self.ROW_H-2), border_radius=5)
+            col = WHT if active else TXT
+
+            # gesture label
+            surf.blit(font_s.render(GESTURE_LABELS[slot], True, col), (bx+20, ry+10))
+
+            # current sound name + arrows
+            idx  = self.cfg.get(slot, 0) % self._n()
+            name = (EFFECT_NAMES[idx] if EFFECT_NAMES else '?')[:34]
+            # left arrow
+            pygame.draw.polygon(surf, P2 if active else P1,
+                                [(bx+bw-152, ry+18),(bx+bw-134, ry+8),(bx+bw-134, ry+28)])
+            surf.blit(font_s.render(name, True, PA4 if active else TXT), (bx+280, ry+10))
+            # index counter
+            surf.blit(font_s.render(f'{idx+1}/{self._n()}', True, TXTSUB), (bx+bw-128, ry+10))
+            # right arrow
+            pygame.draw.polygon(surf, P2 if active else P1,
+                                [(bx+bw-44, ry+18),(bx+bw-62, ry+8),(bx+bw-62, ry+28)])
+
+        # scrollbar
+        if total > self.ROWS:
+            sb_h = bh - 120
+            th   = max(20, sb_h * self.ROWS // total)
+            ty   = int((self._scroll / (total-self.ROWS)) * (sb_h-th))
+            pygame.draw.rect(surf, P1, (bx+bw-10, by+76, 6, sb_h), border_radius=3)
+            pygame.draw.rect(surf, P2, (bx+bw-10, by+76+ty, 6, th), border_radius=3)
+
+        # Randomize / Save buttons
+        rnd_r, save_r = self._btn_rects(bx,by,bw,bh)
+        for rect, label, active in [(rnd_r,'RANDOMIZE',False),(save_r,'SAVE',True)]:
+            pygame.draw.rect(surf, lerp_col(P1,P2,0.4) if active else P1, rect, border_radius=6)
+            pygame.draw.rect(surf, P3 if active else BORDER, rect, 2, border_radius=6)
+            lbl = font_s.render(label, True, PA4 if active else TXT)
+            surf.blit(lbl, (rect.centerx-lbl.get_width()//2, rect.centery-lbl.get_height()//2))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -960,6 +1066,7 @@ class MusicGame:
                 elif ev.key==pygame.K_f: self._toggle_fs()
                 elif ev.key==pygame.K_h: self._show_hints=not self._show_hints
                 elif ev.key==pygame.K_z: self._zen=not self._zen
+                elif ev.key in KEY_SLOTS: self._trigger(KEY_SLOTS[ev.key])
             if ev.type==pygame.MOUSEBUTTONDOWN and ev.button==1:
                 pos=ev.pos
                 # control bar
