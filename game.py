@@ -273,7 +273,8 @@ class AudioEngine:
     def _callback(self, outdata, frames, time_info, status):
         with self._lock:
             playing=self._playing; data=self._data; pos=self._pos
-            dur=self._duration; sfx_list=self._sfx
+            dur=self._duration
+            sfx_list=list(self._sfx)   # snapshot — avoid mutation during iteration
         block = np.zeros((frames,2), dtype=np.float32)
         if playing and data is not None:
             end=min(pos+frames,dur); n=end-pos
@@ -285,12 +286,14 @@ class AudioEngine:
         for item in sfx_list:
             samp,off=item[0],item[1]; n=min(frames,len(samp)-off)
             if n>0:
-                slc=samp[off:off+n].reshape(-1)
+                slc=samp[off:off+n]
                 block[:n,0]+=slc; block[:n,1]+=slc; item[1]+=n
             if item[1]>=len(samp): dead.append(item)
-        with self._lock:
-            for d in dead:
-                if d in self._sfx: self._sfx.remove(d)
+        if dead:
+            with self._lock:
+                for d in dead:
+                    try: self._sfx.remove(d)
+                    except ValueError: pass
         np.clip(block,-1.0,1.0,out=block); outdata[:]=block
 
 
