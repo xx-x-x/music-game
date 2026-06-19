@@ -841,17 +841,58 @@ class ConfigPanel:
         for i, slot in enumerate(GESTURE_SLOTS):
             self.cfg[slot] = idxs[i % len(idxs)]
 
+    # Families of categories that blend well together
+    _HARMONY_GROUPS = [
+        ['bell', 'chimes', 'church-bell', 'sleigh-bells'],   # resonant/tonal bells
+        ['piano', 'flute', 'violins', 'choir', 'orchestra'],  # melodic/classical
+        ['bass', 'drum', 'cymbal', 'rock'],                   # rhythmic/percussive
+        ['synth', 'music', 'suspense-music'],                  # electronic/atmospheric
+        ['brass', 'horn', 'orchestra'],                        # brass/wind
+        ['guitar', 'rock', 'bass'],                            # string/rock
+        ['dj-record-scratch', 'synth', 'drum', 'cymbal'],     # DJ/club
+        ['whistle', 'flute', 'tap', 'chimes'],                # light/airy
+    ]
+
+    def _harmonize(self):
+        if not EFFECT_FILES: return
+        # build a dict: category_name → [file indices]
+        cat_map = {}
+        for i, path in enumerate(EFFECT_FILES):
+            name = os.path.basename(path)
+            # strip trailing _NNNN.ext to get category
+            cat = '_'.join(name.split('_')[:-1]) if '_' in name else os.path.splitext(name)[0]
+            cat_map.setdefault(cat, []).append(i)
+
+        # pick a random harmony group whose categories are all present
+        available = [g for g in self._HARMONY_GROUPS
+                     if any(c in cat_map for c in g)]
+        group = random.choice(available) if available else list(cat_map.keys())
+
+        # collect all file indices from matching categories, shuffle within group
+        pool = []
+        for cat in group:
+            if cat in cat_map:
+                pool.extend(cat_map[cat])
+        if not pool:
+            pool = list(range(len(EFFECT_FILES)))
+        random.shuffle(pool)
+
+        # assign slots — cycle through pool so every slot gets a unique pick if possible
+        for i, slot in enumerate(GESTURE_SLOTS):
+            self.cfg[slot] = pool[i % len(pool)]
+
     # returns rect for a button label/position
     def _btn_rects(self, bx, by, bw, bh):
         btn_y = by + bh - 48
-        rnd   = pygame.Rect(bx + bw//2 - 180, btn_y, 160, 34)
-        save  = pygame.Rect(bx + bw//2 + 20,  btn_y, 160, 34)
+        rnd = pygame.Rect(bx + bw//2 - 245, btn_y, 150, 34)
+        hrm = pygame.Rect(bx + bw//2 -  75, btn_y, 150, 34)
+        save= pygame.Rect(bx + bw//2 +  95, btn_y, 150, 34)
         return rnd, save
 
     def handle_event(self, ev):
         if not self.visible: return False
         bx,by = self._x,self._y; bw,bh = self._W,self._H
-        rnd_r, save_r = self._btn_rects(bx,by,bw,bh)
+        rnd_r, hrm_r, save_r = self._btn_rects(bx,by,bw,bh)
 
         if ev.type == pygame.KEYDOWN:
             if ev.key in (pygame.K_ESCAPE, pygame.K_c): self.close()
@@ -870,6 +911,7 @@ class ConfigPanel:
                 s = GESTURE_SLOTS[self._sel]
                 self.cfg[s] = (self.cfg[s]+1) % self._n()
             elif ev.key == pygame.K_r: self._randomize()
+            elif ev.key == pygame.K_h: self._harmonize()
             elif ev.key == pygame.K_s: save_config(self.cfg)
 
         if ev.type == pygame.MOUSEBUTTONDOWN:
@@ -879,7 +921,8 @@ class ConfigPanel:
                                           self._scroll + (-1 if ev.button==4 else 1)))
                 return True
             if ev.button != 1: return True
-            if rnd_r.collidepoint(mx,my):  self._randomize(); return True
+            if rnd_r.collidepoint(mx,my):  self._randomize();    return True
+            if hrm_r.collidepoint(mx,my):  self._harmonize();    return True
             if save_r.collidepoint(mx,my): save_config(self.cfg); return True
             if not(bx<mx<bx+bw and by<my<by+bh): self.close(); return True
             for vi in range(self.ROWS):
@@ -952,8 +995,8 @@ class ConfigPanel:
             pygame.draw.rect(surf, P2, (bx+bw-10, by+76+ty, 6, th), border_radius=3)
 
         # Randomize / Save buttons
-        rnd_r, save_r = self._btn_rects(bx,by,bw,bh)
-        for rect, label, active in [(rnd_r,'RANDOMIZE',False),(save_r,'SAVE',True)]:
+        rnd_r, hrm_r, save_r = self._btn_rects(bx,by,bw,bh)
+        for rect, label, active in [(rnd_r,'RANDOMIZE',False),(hrm_r,'HARMONIZE',False),(save_r,'SAVE',True)]:
             pygame.draw.rect(surf, lerp_col(P1,P2,0.4) if active else P1, rect, border_radius=6)
             pygame.draw.rect(surf, P3 if active else BORDER, rect, 2, border_radius=6)
             lbl = font_s.render(label, True, PA4 if active else TXT)
