@@ -400,10 +400,16 @@ class HandTracker:
     def __init__(self):
         self._results=None; self._frame=None
         self._lock=threading.Lock(); self._running=False
+        self._cam_idx=0          # current camera index
+        self._cam_switch=False   # signal to reopen with new index
 
     def start(self):
         self._running=True; threading.Thread(target=self._run,daemon=True).start()
     def stop(self): self._running=False
+
+    def next_camera(self):
+        self._cam_idx=(self._cam_idx+1)%4
+        self._cam_switch=True
 
     def get(self):
         with self._lock: return self._results, self._frame
@@ -418,7 +424,8 @@ class HandTracker:
         detector=_mp_vis.HandLandmarker.create_from_options(opts)
         ts=0; fail_streak=0
         while self._running:
-            cap=cv2.VideoCapture(0)
+            self._cam_switch=False
+            cap=cv2.VideoCapture(self._cam_idx)
             if not cap.isOpened():
                 cap.release(); time.sleep(1.0); continue
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,W); cap.set(cv2.CAP_PROP_FRAME_HEIGHT,H)
@@ -430,6 +437,7 @@ class HandTracker:
                     if fail_streak>10:   # camera disconnected — break to outer loop to reopen
                         break
                     time.sleep(0.05); continue
+                if self._cam_switch: break   # user requested a different camera
                 fail_streak=0
                 frame=cv2.flip(frame,1)
                 rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
@@ -1339,6 +1347,7 @@ class MusicGame:
                 elif ev.key==pygame.K_h: self._show_hints=not self._show_hints
                 elif ev.key==pygame.K_z: self._zen=not self._zen
                 elif ev.key==pygame.K_d: self._dj.toggle()
+                elif ev.key==pygame.K_k: self._tracker.next_camera()
                 elif ev.key==pygame.K_m: self._engine.silence_now()
                 elif ev.key==pygame.K_0:
                     if self._engine._gain > 0.01:
@@ -1521,6 +1530,9 @@ class MusicGame:
             if vfx_on:
                 self._mode_bar.draw(screen, self._font_s)
 
+            # ── camera index indicator ──
+            cam_lbl = self._font_s.render(f'CAM {self._tracker._cam_idx}  [K] switch', True, TXTSUB)
+            screen.blit(cam_lbl, (10, H-30))
             # ── warnings ──
             if not AUDIO_OK or not SD_OK:
                 screen.blit(self._font_s.render('! pip install miniaudio sounddevice', True, RED), (10, H-112))
