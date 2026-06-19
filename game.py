@@ -231,14 +231,46 @@ def save_config(cfg):
 
 class AudioEngine:
     def __init__(self):
-        self._lock = threading.Lock()
-        self._data = None; self._pos = 0
+        self._lock  = threading.Lock()
+        self._data  = None; self._fpos = 0.0   # float position for speed
         self._playing = False; self._title = ''; self._duration = 0
-        self._sfx = []; self._stream = None
-        self._gain = 1.0          # master gain (0.0 = silent)
-        self._fade_target = 1.0   # gain we're fading toward
-        self._fade_speed  = 0.0   # gain units per second (0 = instant)
-        self._fade_pending_stop = False
+        self._sfx   = []; self._stream = None
+        # master fade
+        self._gain  = 1.0; self._fade_target = 1.0
+        self._fade_speed = 0.0; self._fade_pending_stop = False
+        # DJ controls
+        self.speed  = 1.0    # playback rate (0.5–2.0); affects pitch too
+        self.track_vol = 1.0 # track volume (0–1)
+        self.bass   = 1.0    # low-shelf gain  (0–2)
+        self.treble = 1.0    # high-shelf gain (0–2)
+        self._lp_state = np.zeros(2); self._hp_state = np.zeros(2)  # filter memories
+
+    # ── simple one-pole shelving filters ──────────────────────────────────────
+    def _apply_eq(self, block):
+        """Apply bass/treble shelf in-place. block shape: (N,2)."""
+        if abs(self.bass - 1.0) < 0.01 and abs(self.treble - 1.0) < 0.01:
+            return block
+        fc_lo = 200.0; fc_hi = 4000.0
+        a_lo = math.exp(-2*math.pi * fc_lo / SR)
+        a_hi = math.exp(-2*math.pi * fc_hi / SR)
+        out = block.copy()
+        # bass shelf: low-pass * (bass-1) added back
+        for ch in range(2):
+            x = out[:,ch]; lp = np.empty_like(x)
+            s = self._lp_state[ch]
+            for i in range(len(x)):
+                s = a_lo*s + (1-a_lo)*x[i]; lp[i] = s
+            self._lp_state[ch] = s
+            out[:,ch] = x + (self.bass - 1.0) * lp
+        # treble shelf: high-pass * (treble-1) added back
+        for ch in range(2):
+            x = out[:,ch]; hp = np.empty_like(x)
+            s = self._hp_state[ch]
+            for i in range(len(x)):
+                s = a_hi*s + (1-a_hi)*x[i]; hp[i] = x[i] - s
+            self._hp_state[ch] = s
+            out[:,ch] = out[:,ch] + (self.treble - 1.0) * hp
+        return out
 
     def load(self, path):
         if not AUDIO_OK: return False
@@ -247,7 +279,7 @@ class AudioEngine:
                                         nchannels=2, sample_rate=SR)
             raw = np.frombuffer(src.samples, dtype=np.float32).reshape(-1, 2)
             with self._lock:
-                self._data = raw; self._pos = 0; self._duration = len(raw)
+                self._data = raw; self._fpos = 0.0; self._duration = len(raw)
             self._title = os.path.splitext(os.path.basename(path))[0]
             return True
         except Exception as e: print(f'load error: {e}'); return False
@@ -257,11 +289,11 @@ class AudioEngine:
 
     def seek(self, frac):
         with self._lock:
-            if self._data is not None: self._pos = int(clamp(frac)*self._duration)
+            if self._data is not None: self._fpos = clamp(frac)*self._duration
 
-    def play_sfx(self, idx):
+    def play_sfx(self, idx, vol=1.0):
         samp = get_effect(idx)
-        with self._lock: self._sfx.append([samp, 0])
+        with self._lock: self._sfx.append([samp, 0, float(vol)])
 
     @property
     def loaded(self): return self._data is not None
@@ -272,11 +304,11 @@ class AudioEngine:
 
     def progress(self):
         with self._lock:
-            return (self._pos/self._duration) if self._duration else 0.0
+            return (self._fpos/self._duration) if self._duration else 0.0
 
     def duration_s(self): return self._duration/SR
     def position_s(self):
-        with self._lock: return self._pos/SR
+        with self._lock: return self._fpos/SR
 
     def start(self):
         if not SD_OK: return
@@ -288,17 +320,12 @@ class AudioEngine:
         if self._stream: self._stream.stop(); self._stream.close()
 
     def silence_now(self):
-        """Instant cut: stop playback, clear all SFX, reset gain."""
         with self._lock:
-            self._playing = False
-            self._sfx.clear()
-            self._gain = 1.0
-            self._fade_target = 1.0
-            self._fade_speed  = 0.0
-            self._fade_pending_stop = False
+            self._playing = False; self._sfx.clear()
+            self._gain = 1.0; self._fade_target = 1.0
+            self._fade_speed = 0.0; self._fade_pending_stop = False
 
     def fade_to_silence(self, duration=1.5):
-        """Fade out over `duration` seconds, then stop playback and clear SFX."""
         with self._lock:
             self._fade_target = 0.0
             self._fade_speed  = 1.0 / max(duration, 0.05)
@@ -306,30 +333,40 @@ class AudioEngine:
 
     def fade_in(self, duration=0.5):
         with self._lock:
-            self._playing = True
-            self._fade_target = 1.0
-            self._fade_speed  = 1.0 / max(duration, 0.05)
+            self._playing = True; self._fade_target = 1.0
+            self._fade_speed = 1.0 / max(duration, 0.05)
             self._fade_pending_stop = False
 
     def _callback(self, outdata, frames, time_info, status):
         with self._lock:
-            playing=self._playing; data=self._data; pos=self._pos
-            dur=self._duration
-            sfx_list=list(self._sfx)
-            gain=self._gain; target=self._fade_target; speed=self._fade_speed
-            pending_stop=getattr(self,'_fade_pending_stop',False)
+            playing=self._playing; data=self._data; fpos=self._fpos
+            dur=self._duration; sfx_list=list(self._sfx)
+            gain=self._gain; target=self._fade_target; fspeed=self._fade_speed
+            pending_stop=self._fade_pending_stop
+            spd=self.speed; tvol=self.track_vol
+
         block = np.zeros((frames,2), dtype=np.float32)
-        if playing and data is not None:
-            end=min(pos+frames,dur); n=end-pos
-            if n>0: block[:n]=data[pos:end]
-            new_pos=pos+frames
-            if new_pos>=dur: new_pos=0
-            with self._lock: self._pos=new_pos
+        if playing and data is not None and dur > 0:
+            # speed-shifted read via linear interpolation
+            src_len = int(frames * spd) + 2
+            i0 = int(fpos); i1 = min(i0 + src_len, dur)
+            chunk = data[i0:i1]
+            if len(chunk) > 1:
+                t_in  = np.arange(len(chunk))
+                t_out = np.linspace(0, len(chunk)-1, frames)
+                for ch in range(2):
+                    block[:,ch] = np.interp(t_out, t_in, chunk[:,ch])
+            new_fpos = fpos + frames * spd
+            if new_fpos >= dur: new_fpos = 0.0
+            block *= tvol
+            with self._lock: self._fpos = new_fpos
+
         dead=[]
         for item in sfx_list:
-            samp,off=item[0],item[1]; n=min(frames,len(samp)-off)
+            samp,off,vol = item[0],item[1],item[2]
+            n=min(frames,len(samp)-off)
             if n>0:
-                slc=samp[off:off+n]
+                slc=samp[off:off+n]*vol
                 block[:n,0]+=slc; block[:n,1]+=slc; item[1]+=n
             if item[1]>=len(samp): dead.append(item)
         if dead:
@@ -337,18 +374,19 @@ class AudioEngine:
                 for d in dead:
                     try: self._sfx.remove(d)
                     except ValueError: pass
-        # apply gain / fade
-        if speed > 0:
-            dt_block = frames / SR
-            new_gain = gain + (target - gain) * min(1.0, speed * dt_block)
-            if abs(new_gain - target) < 0.002: new_gain = target
-            with self._lock: self._gain = new_gain
+
+        block = self._apply_eq(block)
+
+        if fspeed > 0:
+            dt_block = frames/SR
+            new_gain = gain + (target-gain)*min(1.0, fspeed*dt_block)
+            if abs(new_gain-target)<0.002: new_gain=target
+            with self._lock: self._gain=new_gain
             block *= new_gain
-            if new_gain == 0.0 and pending_stop:
+            if new_gain==0.0 and pending_stop:
                 with self._lock:
-                    self._playing = False
-                    self._sfx.clear()
-                    self._fade_pending_stop = False
+                    self._playing=False; self._sfx.clear()
+                    self._fade_pending_stop=False
         else:
             block *= gain
         np.clip(block,-1.0,1.0,out=block); outdata[:]=block
@@ -871,8 +909,9 @@ class ConfigPanel:
         self.cfg     = cfg
         self._sel    = 0
         self._scroll = 0          # first visible gesture row
-        self._W = 860; self._H = 520
+        self._W = 900; self._H = 540
         self._x = (W - self._W)//2; self._y = (H - self._H)//2
+        self._waveforms = {}      # idx → pygame.Surface thumbnail
 
     def _n(self): return max(1, len(EFFECT_FILES))
 
@@ -976,14 +1015,36 @@ class ConfigPanel:
                 ry   = by + 76 + vi*self.ROW_H
                 if not(ry < my < ry+self.ROW_H): continue
                 self._sel = gi
-                # < > arrows
-                arr_l = pygame.Rect(bx+bw-150, ry+4, 28, 28)
-                arr_r = pygame.Rect(bx+bw-46,  ry+4, 28, 28)
+                arr_l = pygame.Rect(bx+bw-220, ry+4, 28, 28)
+                arr_r = pygame.Rect(bx+bw-116, ry+4, 28, 28)
                 if arr_l.collidepoint(mx,my):
                     self.cfg[slot] = (self.cfg[slot]-1) % self._n()
                 elif arr_r.collidepoint(mx,my):
                     self.cfg[slot] = (self.cfg[slot]+1) % self._n()
+                else:
+                    # volume bar click (right side of row)
+                    vol_x = bx+bw-100; vol_w = 80
+                    if vol_x < mx < vol_x+vol_w:
+                        self.cfg[f'vol_{slot}'] = int((mx-vol_x)/vol_w*100)
         return True
+
+    def _waveform_surf(self, idx, w=120, h=28):
+        if idx in self._waveforms: return self._waveforms[idx]
+        samp = get_effect(idx)
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        if len(samp) > 1:
+            n_bins = w
+            bins   = np.array_split(np.abs(samp), n_bins)
+            peaks  = [float(b.max()) if len(b) else 0 for b in bins]
+            mx_pk  = max(peaks) or 1.0
+            mid    = h//2
+            for xi, pk in enumerate(peaks):
+                amp = int(pk/mx_pk * mid)
+                col = (*PA3, 180)
+                pygame.draw.line(surf, col, (xi, mid-amp), (xi, mid+amp))
+        if len(self._waveforms) > 400: self._waveforms.clear()
+        self._waveforms[idx] = surf
+        return surf
 
     def draw(self, surf, font_m, font_s):
         if not self.visible: return
@@ -992,59 +1053,173 @@ class ConfigPanel:
         pygame.draw.rect(s, P3, (0,0,bw,bh), 2, border_radius=10)
         surf.blit(s, (bx,by))
 
-        # title
-        surf.blit(font_m.render('GESTURE  SOUND  CONFIG', True, P3), (bx+16, by+14))
-        surf.blit(font_s.render('[UP/DN] select   [LT/RT] change sound   [R] randomize   [S] save   [ESC] close',
-                                True, TXTSUB), (bx+16, by+42))
-
-        # column headers
-        surf.blit(font_s.render('GESTURE',   True, P2), (bx+20,  by+62))
-        surf.blit(font_s.render('SOUND',     True, P2), (bx+280, by+62))
-        surf.blit(font_s.render('#',         True, P2), (bx+bw-220, by+62))
+        surf.blit(font_m.render('GESTURE  SOUND  CONFIG', True, P3), (bx+16, by+12))
+        surf.blit(font_s.render('[UP/DN] select  [LT/RT] change  [R] random  [H] harmonize  [S] save  [ESC] close',
+                                True, TXTSUB), (bx+16, by+38))
+        # headers
+        surf.blit(font_s.render('GESTURE', True, P2), (bx+16,  by+60))
+        surf.blit(font_s.render('SOUND',   True, P2), (bx+220, by+60))
+        surf.blit(font_s.render('WAVE',    True, P2), (bx+560, by+60))
+        surf.blit(font_s.render('VOL',     True, P2), (bx+bw-106, by+60))
 
         total = len(GESTURE_SLOTS)
         for vi in range(self.ROWS):
             gi = self._scroll + vi
             if gi >= total: break
             slot   = GESTURE_SLOTS[gi]
-            ry     = by + 76 + vi*self.ROW_H
+            ry     = by + 74 + vi*self.ROW_H
             active = gi == self._sel
-
             if active:
                 pygame.draw.rect(surf, (*P2,50), (bx+4, ry, bw-8, self.ROW_H-2), border_radius=5)
             col = WHT if active else TXT
 
             # gesture label
-            surf.blit(font_s.render(GESTURE_LABELS[slot], True, col), (bx+20, ry+10))
+            surf.blit(font_s.render(GESTURE_LABELS[slot], True, col), (bx+16, ry+10))
 
-            # current sound name + arrows
+            # sound name + arrows
             idx  = self.cfg.get(slot, 0) % self._n()
-            name = (EFFECT_NAMES[idx] if EFFECT_NAMES else '?')[:34]
-            # left arrow
+            name = (EFFECT_NAMES[idx] if EFFECT_NAMES else '?')[:22]
             pygame.draw.polygon(surf, P2 if active else P1,
-                                [(bx+bw-152, ry+18),(bx+bw-134, ry+8),(bx+bw-134, ry+28)])
-            surf.blit(font_s.render(name, True, PA4 if active else TXT), (bx+280, ry+10))
-            # index counter
-            surf.blit(font_s.render(f'{idx+1}/{self._n()}', True, TXTSUB), (bx+bw-128, ry+10))
-            # right arrow
+                                [(bx+218, ry+18),(bx+236, ry+8),(bx+236, ry+28)])
+            surf.blit(font_s.render(name, True, PA4 if active else TXT), (bx+242, ry+10))
+            surf.blit(font_s.render(f'{idx+1}/{self._n()}', True, TXTSUB), (bx+500, ry+10))
             pygame.draw.polygon(surf, P2 if active else P1,
-                                [(bx+bw-44, ry+18),(bx+bw-62, ry+8),(bx+bw-62, ry+28)])
+                                [(bx+bw-230, ry+18),(bx+bw-248, ry+8),(bx+bw-248, ry+28)])
+
+            # waveform thumbnail
+            wf = self._waveform_surf(idx)
+            surf.blit(wf, (bx+560, ry+4))
+
+            # volume bar (click to set)
+            vol = self.cfg.get(f'vol_{slot}', 100)
+            vx  = bx+bw-100; vw=80; vh=14; vy=ry+12
+            pygame.draw.rect(surf, P1,          (vx, vy, vw, vh), border_radius=3)
+            pygame.draw.rect(surf, P3,          (vx, vy, int(vw*vol/100), vh), border_radius=3)
+            pygame.draw.rect(surf, BORDER,      (vx, vy, vw, vh), 1, border_radius=3)
+            surf.blit(font_s.render(f'{vol}%', True, TXTSUB), (vx+vw+4, vy-2))
 
         # scrollbar
         if total > self.ROWS:
-            sb_h = bh - 120
-            th   = max(20, sb_h * self.ROWS // total)
-            ty   = int((self._scroll / (total-self.ROWS)) * (sb_h-th))
-            pygame.draw.rect(surf, P1, (bx+bw-10, by+76, 6, sb_h), border_radius=3)
-            pygame.draw.rect(surf, P2, (bx+bw-10, by+76+ty, 6, th), border_radius=3)
+            sb_h = bh-130; th = max(20, sb_h*self.ROWS//total)
+            ty   = int((self._scroll/(total-self.ROWS))*(sb_h-th))
+            pygame.draw.rect(surf, P1, (bx+bw-8, by+74, 5, sb_h), border_radius=3)
+            pygame.draw.rect(surf, P2, (bx+bw-8, by+74+ty, 5, th), border_radius=3)
 
-        # Randomize / Save buttons
         rnd_r, hrm_r, save_r = self._btn_rects(bx,by,bw,bh)
-        for rect, label, active in [(rnd_r,'RANDOMIZE',False),(hrm_r,'HARMONIZE',False),(save_r,'SAVE',True)]:
-            pygame.draw.rect(surf, lerp_col(P1,P2,0.4) if active else P1, rect, border_radius=6)
-            pygame.draw.rect(surf, P3 if active else BORDER, rect, 2, border_radius=6)
-            lbl = font_s.render(label, True, PA4 if active else TXT)
+        for rect, label, hi in [(rnd_r,'RANDOMIZE',False),(hrm_r,'HARMONIZE',False),(save_r,'SAVE',True)]:
+            pygame.draw.rect(surf, lerp_col(P1,P2,0.4) if hi else P1, rect, border_radius=6)
+            pygame.draw.rect(surf, P3 if hi else BORDER, rect, 2, border_radius=6)
+            lbl = font_s.render(label, True, PA4 if hi else TXT)
             surf.blit(lbl, (rect.centerx-lbl.get_width()//2, rect.centery-lbl.get_height()//2))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DJ Panel
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DJPanel:
+    """Floating DJ controls: speed/pitch, bass, treble, track volume. [D] to open."""
+    W, H = 420, 300
+
+    KNOBS = [
+        ('speed',  'PITCH / SPEED', 0.5, 2.0,  1.0),
+        ('track_vol', 'TRACK VOL',  0.0, 1.0,  1.0),
+        ('bass',   'BASS',          0.0, 2.0,  1.0),
+        ('treble', 'TREBLE',        0.0, 2.0,  1.0),
+    ]
+
+    def __init__(self, engine):
+        self._engine  = engine
+        self.visible  = False
+        self._x = W - self.W - 16
+        self._y = 88
+        self._drag = None   # (knob_key, start_mx, start_val)
+
+    def toggle(self): self.visible = not self.visible
+
+    def _slider_rect(self, i):
+        x = self._x + 20
+        y = self._y + 52 + i * 56
+        return pygame.Rect(x, y, self.W - 40, 14)
+
+    def _get(self, key):
+        return getattr(self._engine, key, 1.0)
+
+    def _set(self, key, val, lo, hi):
+        val = max(lo, min(hi, val))
+        setattr(self._engine, key, val)
+
+    def handle_event(self, ev):
+        if not self.visible: return False
+        bx, by = self._x, self._y
+        if ev.type == pygame.KEYDOWN and ev.key == pygame.K_d:
+            self.visible = False; return True
+
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            mx, my = ev.pos
+            # close if outside
+            if not (bx < mx < bx+self.W and by < my < by+self.H):
+                self.visible = False; return False
+            for i, (key, _, lo, hi, _) in enumerate(self.KNOBS):
+                r = self._slider_rect(i)
+                if r.inflate(0, 20).collidepoint(mx, my):
+                    frac = (mx - r.x) / r.w
+                    self._set(key, lo + frac*(hi-lo), lo, hi)
+                    self._drag = (key, mx, self._get(key), lo, hi)
+                    return True
+            # reset double-click: check title bar area
+            if by < my < by+40:
+                for key,_,lo,hi,default in self.KNOBS:
+                    setattr(self._engine, key, default)
+                return True
+
+        if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+            self._drag = None
+
+        if ev.type == pygame.MOUSEMOTION and self._drag:
+            key, sx, sv, lo, hi = self._drag
+            r = self._slider_rect(next(i for i,(k,*_) in enumerate(self.KNOBS) if k==key))
+            frac = (ev.pos[0] - r.x) / r.w
+            self._set(key, lo + frac*(hi-lo), lo, hi)
+            return True
+
+        return True   # swallow all events while open
+
+    def draw(self, surf, font_m, font_s):
+        if not self.visible: return
+        bx, by = self._x, self._y
+        panel = pygame.Surface((self.W, self.H), pygame.SRCALPHA)
+        panel.fill((*P0, 245))
+        pygame.draw.rect(panel, P3, (0,0,self.W,self.H), 2, border_radius=10)
+        surf.blit(panel, (bx, by))
+        surf.blit(font_m.render('DJ  CONTROLS', True, P3), (bx+16, by+12))
+        surf.blit(font_s.render('click title to reset all', True, TXTSUB), (bx+200, by+18))
+
+        for i, (key, label, lo, hi, default) in enumerate(self.KNOBS):
+            val = self._get(key)
+            frac = (val - lo) / (hi - lo)
+            r  = self._slider_rect(i)
+            ry = r.y - 18
+            surf.blit(font_s.render(label, True, P2), (bx+20, ry))
+            # value text
+            if key == 'speed':
+                vstr = f'{val:.2f}x'
+            elif key == 'track_vol':
+                vstr = f'{int(val*100)}%'
+            else:
+                vstr = f'{val:.2f}'
+            surf.blit(font_s.render(vstr, True, PA4), (bx+self.W-60, ry))
+            # track
+            pygame.draw.rect(surf, P1, r, border_radius=4)
+            fill = r.copy(); fill.w = int(r.w * frac)
+            pygame.draw.rect(surf, P3, fill, border_radius=4)
+            # default marker
+            dx = r.x + int(r.w * (default-lo)/(hi-lo))
+            pygame.draw.line(surf, PA2, (dx, r.y-2), (dx, r.y+r.h+2), 1)
+            # thumb
+            tx = r.x + int(r.w * frac)
+            pygame.draw.circle(surf, P4, (tx, r.centery), 9)
+            pygame.draw.circle(surf, PA4, (tx, r.centery), 9, 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1112,6 +1287,7 @@ class MusicGame:
         self._vfx          = VFXEngine()
         self._ctrl         = ControlBar()
         self._mode_bar     = ModeBar(self._vfx)
+        self._dj           = DJPanel(self._engine)
 
         self._flash_name  = ''; self._flash_alpha=0.0
         self._hand_flash  = {'Left':0.0,'Right':0.0}
@@ -1128,7 +1304,8 @@ class MusicGame:
     def _trigger(self, slot, lm=None):
         eff_idx=self._cfg.get(slot,0)
         if self._ctrl.sound_on:
-            self._engine.play_sfx(eff_idx)
+            vol = self._cfg.get(f'vol_{slot}', 100) / 100.0
+            self._engine.play_sfx(eff_idx, vol)
         if EFFECT_NAMES:
             self._flash_name=EFFECT_NAMES[eff_idx%len(EFFECT_NAMES)]
             self._flash_alpha=1.0
@@ -1150,6 +1327,7 @@ class MusicGame:
         global _last_hands
         for ev in pygame.event.get():
             if ev.type==pygame.QUIT: self._running=False; return
+            if self._dj.handle_event(ev): continue
             if self._config_panel.handle_event(ev): continue
             if self._picker.handle_event(ev,self._engine): continue
             if ev.type==pygame.KEYDOWN:
@@ -1160,6 +1338,7 @@ class MusicGame:
                 elif ev.key==pygame.K_f: self._toggle_fs()
                 elif ev.key==pygame.K_h: self._show_hints=not self._show_hints
                 elif ev.key==pygame.K_z: self._zen=not self._zen
+                elif ev.key==pygame.K_d: self._dj.toggle()
                 elif ev.key==pygame.K_m: self._engine.silence_now()
                 elif ev.key==pygame.K_0:
                     if self._engine._gain > 0.01:
@@ -1350,6 +1529,7 @@ class MusicGame:
 
             self._picker.draw(screen,self._font_m,self._font_s)
             self._config_panel.draw(screen,self._font_m,self._font_s)
+            self._dj.draw(screen,self._font_m,self._font_s)
 
         pygame.display.flip()
 
