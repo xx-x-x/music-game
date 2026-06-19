@@ -137,28 +137,28 @@ class Smooth:
     def __call__(self, v):
         self.buf.append(v); return sum(self.buf)/len(self.buf)
 
-_glow_cache: dict = {}   # radius → pre-built white glow surface
+_glow_cache: dict = {}   # (radius, color, alpha) → pre-tinted glow surface
+_GLOW_CACHE_MAX = 256    # evict oldest when over this size
 
 def _glow(surf, cx, cy, r, color, max_alpha=180):
-    """Additive soft glow — reuses cached alpha mask, tinted per call."""
+    """Additive soft glow — fully cached per (r, color, alpha) triple."""
     if r < 2: return
-    if r not in _glow_cache:
+    r = int(r)
+    alpha = int(max_alpha)
+    key = (r, color, alpha)
+    if key not in _glow_cache:
+        if len(_glow_cache) >= _GLOW_CACHE_MAX:
+            # drop ~quarter of entries (oldest inserted keys)
+            drop = list(_glow_cache)[:_GLOW_CACHE_MAX // 4]
+            for k in drop: del _glow_cache[k]
         gs = pygame.Surface((r*2, r*2), pygame.SRCALPHA)
         layers = min(r, 10)
         for i in range(layers):
             ri = max(1, r - i*(r//layers))
-            a  = int(220 * (i/layers)**1.4)
-            pygame.draw.circle(gs, (255, 255, 255, a), (r, r), ri)
-        _glow_cache[r] = gs
-    # tint the cached mask to the requested color at the requested alpha
-    gs = _glow_cache[r]
-    tinted = pygame.Surface((r*2, r*2), pygame.SRCALPHA)
-    tinted.fill((*color, 0))
-    tinted.blit(gs, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
-    # scale alpha by max_alpha/220
-    if max_alpha < 200:
-        tinted.set_alpha(int(max_alpha * 255 // 220))
-    surf.blit(tinted, (cx-r, cy-r), special_flags=pygame.BLEND_RGBA_ADD)
+            a  = int(alpha * (i/layers)**1.4)
+            pygame.draw.circle(gs, (*color, a), (r, r), ri)
+        _glow_cache[key] = gs
+    surf.blit(_glow_cache[key], (cx-r, cy-r), special_flags=pygame.BLEND_RGBA_ADD)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -887,7 +887,7 @@ class ConfigPanel:
         rnd = pygame.Rect(bx + bw//2 - 245, btn_y, 150, 34)
         hrm = pygame.Rect(bx + bw//2 -  75, btn_y, 150, 34)
         save= pygame.Rect(bx + bw//2 +  95, btn_y, 150, 34)
-        return rnd, save
+        return rnd, hrm, save
 
     def handle_event(self, ev):
         if not self.visible: return False
