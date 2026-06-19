@@ -96,7 +96,7 @@ GESTURE_EMOJI = {
     'both_peace':  'V+V',
 }
 
-VFX_NAMES = ['Nebula', 'Shader']
+VFX_NAMES = ['Nebula', 'Snowflakes', 'Shader']
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -424,6 +424,11 @@ class VFXEngine:
         self._stars = [(rng.randint(0,W), rng.randint(0,H),
                         rng.uniform(0.3,1.0)) for _ in range(160)]
 
+        # snowflakes: each is [x, y, size, speed, angle, angle_vel, col_t]
+        # spawned once and loop forever (wrap at bottom)
+        self._flakes = []
+        self._init_flakes()
+
     # ── public interface ──────────────────────────────────────────────────────
 
     def next_mode(self): self.mode=(self.mode+1)%len(VFX_NAMES); self._clear()
@@ -431,6 +436,7 @@ class VFXEngine:
 
     def _clear(self):
         self._particles.clear()
+        self._init_flakes()
 
     def on_gesture(self, slot, lm):
         """Called when any gesture fires. lm = hand landmark list or None."""
@@ -442,7 +448,8 @@ class VFXEngine:
     def update(self, dt, hands):
         self._t += dt
         m = VFX_NAMES[self.mode]
-        if m == 'Nebula': self._upd_nebula(dt, hands)
+        if m == 'Nebula':      self._upd_nebula(dt, hands)
+        elif m == 'Snowflakes': self._upd_flakes(dt, hands)
         self._particles=[p for p in self._particles if p[4]>0]
         for p in self._particles:
             p[0]+=p[2]*dt*60; p[1]+=p[3]*dt*60
@@ -451,7 +458,8 @@ class VFXEngine:
 
     def draw(self, surf):
         m = VFX_NAMES[self.mode]
-        if m == 'Nebula': self._drw_nebula(surf)
+        if m == 'Nebula':       self._drw_nebula(surf)
+        elif m == 'Snowflakes': self._drw_flakes(surf)
 
     # ── color bomb (peace sign trigger) ─────────────────────────────────────
 
@@ -464,6 +472,18 @@ class VFXEngine:
                 col   = pal_col(random.random())
                 self._emit(cx, cy, math.cos(angle)*speed, math.sin(angle)*speed,
                            random.uniform(0.8,1.8), col, random.randint(3,8))
+        elif m == 'Snowflakes':
+            # burst: scatter all flakes outward from touch point then let them drift back
+            for f in self._flakes:
+                dx = f[0] - cx; dy = f[1] - cy
+                dist = math.hypot(dx, dy) or 1
+                push = random.uniform(4.0, 12.0) / dist * 120
+                f[6] = dx/dist * push   # vx impulse stored in slot 6
+                f[7] = dy/dist * push   # vy impulse stored in slot 7
+            # also change all flake colours
+            t0 = random.random()
+            for i, f in enumerate(self._flakes):
+                f[8] = (t0 + i/len(self._flakes)) % 1.0
 
     # ── nebula ────────────────────────────────────────────────────────────────
 
@@ -490,6 +510,89 @@ class VFXEngine:
             a=int(br*100); pygame.draw.circle(lay,(*P2,a),(sx,sy),1)
         self._drw_particles_on(lay)
         surf.blit(lay,(0,0), special_flags=pygame.BLEND_RGBA_ADD)
+
+    # ── snowflakes ────────────────────────────────────────────────────────────
+
+    _N_FLAKES = 180
+
+    def _init_flakes(self):
+        # flake: [x, y, size, fall_speed, angle, angle_vel, vx, vy, col_t]
+        rng = random.Random()
+        self._flakes = [
+            [rng.uniform(0, W),
+             rng.uniform(-H, 0),          # start above screen so they trickle in
+             rng.uniform(2.0, 8.0),        # size (radius)
+             rng.uniform(0.4, 1.6),        # base fall speed (px/frame at 60fps)
+             rng.uniform(0, math.pi*2),    # wobble angle
+             rng.uniform(-0.02, 0.02),     # wobble angular velocity
+             0.0,                          # vx impulse (from colour bomb)
+             0.0,                          # vy impulse (from colour bomb)
+             rng.random()]                 # col_t (palette position)
+            for _ in range(self._N_FLAKES)
+        ]
+
+    def _upd_flakes(self, dt, hands):
+        speed60 = dt * 60
+        for f in self._flakes:
+            # wobble angle advances
+            f[4] += f[5] * speed60
+            # horizontal wobble + impulse decay
+            f[6] *= 0.92
+            f[7] *= 0.92
+            f[0] += math.sin(f[4]) * 0.6 * speed60 + f[6] * speed60
+            f[1] += f[3] * speed60 + f[7] * speed60
+            # wrap
+            if f[1] > H + f[2]:
+                f[1] = -f[2]
+                f[0] = random.uniform(0, W)
+            if f[0] < -f[2]:  f[0] = W + f[2]
+            if f[0] > W+f[2]: f[0] = -f[2]
+            # slow colour drift
+            f[8] = (f[8] + dt * 0.04) % 1.0
+
+        # hand proximity: flakes near a hand speed up and glow
+        for side in ('Left', 'Right'):
+            lm = hands.get(side)
+            if lm is None: continue
+            hx = lm[9][0]*W; hy = lm[9][1]*H
+            for f in self._flakes:
+                d = math.hypot(f[0]-hx, f[1]-hy)
+                if d < 120:
+                    pull = (1 - d/120) * 3.0
+                    f[6] += (hx-f[0]) / max(d,1) * pull * dt * 60
+                    f[7] += (hy-f[1]) / max(d,1) * pull * dt * 60
+
+    def _draw_snowflake(self, surf, x, y, size, col, alpha):
+        """6-armed snowflake using lines."""
+        ix, iy = int(x), int(y)
+        c = (*col, alpha)
+        arm = int(size)
+        for i in range(6):
+            a = math.pi * i / 3
+            ex = ix + int(math.cos(a) * arm)
+            ey = iy + int(math.sin(a) * arm)
+            pygame.draw.line(surf, c, (ix, iy), (ex, ey), max(1, int(size*0.22)))
+            # two small branches on each arm at 60% length
+            for side_sign in (-1, 1):
+                bx = ix + int(math.cos(a) * arm * 0.55)
+                by = iy + int(math.sin(a) * arm * 0.55)
+                ba = a + side_sign * math.pi / 4
+                br = arm * 0.35
+                pygame.draw.line(surf, c, (bx, by),
+                                 (bx + int(math.cos(ba)*br), by + int(math.sin(ba)*br)),
+                                 max(1, int(size*0.15)))
+
+    def _drw_flakes(self, surf):
+        lay = self._lay; lay.fill((0,0,0,0))
+        for f in self._flakes:
+            x, y, size, _, _, _, _, _, col_t = f
+            col = pal_col(col_t)
+            # larger flakes are more opaque
+            alpha = int(80 + (size / 8.0) * 140)
+            self._draw_snowflake(lay, x, y, size, col, alpha)
+            if size > 5:
+                _glow(lay, int(x), int(y), int(size*1.8), col, int(alpha*0.4))
+        surf.blit(lay, (0,0), special_flags=pygame.BLEND_RGBA_ADD)
 
     # ── particle helpers ──────────────────────────────────────────────────────
 
