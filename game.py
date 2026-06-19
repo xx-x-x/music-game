@@ -287,6 +287,16 @@ class AudioEngine:
     def stop(self):
         if self._stream: self._stream.stop(); self._stream.close()
 
+    def silence_now(self):
+        """Instant cut: stop playback, clear all SFX, reset gain."""
+        with self._lock:
+            self._playing = False
+            self._sfx.clear()
+            self._gain = 1.0
+            self._fade_target = 1.0
+            self._fade_speed  = 0.0
+            self._fade_pending_stop = False
+
     def fade_to_silence(self, duration=1.5):
         """Fade out over `duration` seconds, then stop playback and clear SFX."""
         with self._lock:
@@ -1150,6 +1160,7 @@ class MusicGame:
                 elif ev.key==pygame.K_f: self._toggle_fs()
                 elif ev.key==pygame.K_h: self._show_hints=not self._show_hints
                 elif ev.key==pygame.K_z: self._zen=not self._zen
+                elif ev.key==pygame.K_m: self._engine.silence_now()
                 elif ev.key==pygame.K_0:
                     if self._engine._gain > 0.01:
                         self._engine.fade_to_silence(1.5)
