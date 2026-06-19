@@ -235,6 +235,10 @@ class AudioEngine:
         self._data = None; self._pos = 0
         self._playing = False; self._title = ''; self._duration = 0
         self._sfx = []; self._stream = None
+        self._gain = 1.0          # master gain (0.0 = silent)
+        self._fade_target = 1.0   # gain we're fading toward
+        self._fade_speed  = 0.0   # gain units per second (0 = instant)
+        self._fade_pending_stop = False
 
     def load(self, path):
         if not AUDIO_OK: return False
@@ -283,11 +287,27 @@ class AudioEngine:
     def stop(self):
         if self._stream: self._stream.stop(); self._stream.close()
 
+    def fade_to_silence(self, duration=1.5):
+        """Fade out over `duration` seconds, then stop playback and clear SFX."""
+        with self._lock:
+            self._fade_target = 0.0
+            self._fade_speed  = 1.0 / max(duration, 0.05)
+            self._fade_pending_stop = True
+
+    def fade_in(self, duration=0.5):
+        with self._lock:
+            self._playing = True
+            self._fade_target = 1.0
+            self._fade_speed  = 1.0 / max(duration, 0.05)
+            self._fade_pending_stop = False
+
     def _callback(self, outdata, frames, time_info, status):
         with self._lock:
             playing=self._playing; data=self._data; pos=self._pos
             dur=self._duration
-            sfx_list=list(self._sfx)   # snapshot — avoid mutation during iteration
+            sfx_list=list(self._sfx)
+            gain=self._gain; target=self._fade_target; speed=self._fade_speed
+            pending_stop=getattr(self,'_fade_pending_stop',False)
         block = np.zeros((frames,2), dtype=np.float32)
         if playing and data is not None:
             end=min(pos+frames,dur); n=end-pos
@@ -307,6 +327,20 @@ class AudioEngine:
                 for d in dead:
                     try: self._sfx.remove(d)
                     except ValueError: pass
+        # apply gain / fade
+        if speed > 0:
+            dt_block = frames / SR
+            new_gain = gain + (target - gain) * min(1.0, speed * dt_block)
+            if abs(new_gain - target) < 0.002: new_gain = target
+            with self._lock: self._gain = new_gain
+            block *= new_gain
+            if new_gain == 0.0 and pending_stop:
+                with self._lock:
+                    self._playing = False
+                    self._sfx.clear()
+                    self._fade_pending_stop = False
+        else:
+            block *= gain
         np.clip(block,-1.0,1.0,out=block); outdata[:]=block
 
 
@@ -1116,6 +1150,11 @@ class MusicGame:
                 elif ev.key==pygame.K_f: self._toggle_fs()
                 elif ev.key==pygame.K_h: self._show_hints=not self._show_hints
                 elif ev.key==pygame.K_z: self._zen=not self._zen
+                elif ev.key==pygame.K_0:
+                    if self._engine._gain > 0.01:
+                        self._engine.fade_to_silence(1.5)
+                    else:
+                        self._engine.fade_in(0.5)
                 elif ev.key in KEY_SLOTS: self._trigger(KEY_SLOTS[ev.key])
             if ev.type==pygame.MOUSEBUTTONDOWN and ev.button==1:
                 pos=ev.pos
